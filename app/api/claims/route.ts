@@ -1,13 +1,21 @@
 import { NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { and, eq, gt } from "drizzle-orm";
+import { z } from "zod";
 
 import { db } from "@/lib/db";
 import { claims, foodPosts, users } from "@/lib/schema";
 
+const claimSchema = z.object({
+  foodId: z.coerce
+    .number()
+    .int()
+    .positive(),
+});
+
 export async function POST(request: Request) {
   try {
-    // Check authentication
+    // 1. Authentication
     const { userId: clerkId } = await auth();
 
     if (!clerkId) {
@@ -17,18 +25,32 @@ export async function POST(request: Request) {
       );
     }
 
-    // Read request body
-    const body = await request.json();
-    const foodId = Number(body.foodId);
+    // 2. Read and validate request body
+    let body: unknown;
 
-    if (!Number.isInteger(foodId)) {
+    try {
+      body = await request.json();
+    } catch {
       return NextResponse.json(
-        { error: "Invalid food post" },
+        { error: "Invalid JSON request body" },
         { status: 400 }
       );
     }
 
-    // Find our user in the database
+    const result = claimSchema.safeParse(body);
+
+    if (!result.success) {
+      return NextResponse.json(
+        {
+          error: "Invalid food post ID",
+        },
+        { status: 400 }
+      );
+    }
+
+    const { foodId } = result.data;
+
+    // 3. Find logged-in database user
     const [user] = await db
       .select()
       .from(users)
@@ -42,7 +64,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Find the food post
+    // 4. Find food post
     const [food] = await db
       .select()
       .from(foodPosts)
@@ -56,94 +78,106 @@ export async function POST(request: Request) {
       );
     }
 
-    // Prevent owner from claiming their own food
+    // 5. Prevent owner from claiming own food
     if (food.userId === user.id) {
       return NextResponse.json(
-        { error: "You cannot claim your own food post" },
+        {
+          error: "You cannot claim your own food post",
+        },
         { status: 400 }
       );
     }
 
-    // Check current status
+    // 6. Check current status
     if (food.status !== "available") {
       return NextResponse.json(
-        { error: "This food is no longer available" },
+        {
+          error: "This food is no longer available",
+        },
         { status: 409 }
       );
     }
 
-    // Check expiration
-    if (new Date(food.availableUntil) <= new Date()) {
+    // 7. Check expiration
+    const now = new Date();
+
+    if (new Date(food.availableUntil) <= now) {
       return NextResponse.json(
-        { error: "This food is no longer available" },
+        {
+          error: "This food is no longer available",
+        },
         { status: 400 }
       );
     }
 
     /*
-     * The important part:
+     * 8. Atomic claim operation
      *
-     * We first change the food from "available" to "claimed".
+     * The food is changed from:
      *
-     * BUT we only allow the update when:
+     * available → claimed
      *
-     * 1. The food ID matches
-     * 2. The food is STILL available
-     * 3. The food has NOT expired
+     * only if it is STILL available and
+     * has not expired.
      *
-     * This prevents two users from claiming the same food.
+     * This prevents two users from
+     * successfully claiming the same food.
      */
-    const result = await db.transaction(async (tx) => {
-      const [updatedFood] = await tx
-        .update(foodPosts)
-        .set({
-          status: "claimed",
-        })
-        .where(
-          and(
-            eq(foodPosts.id, foodId),
-            eq(foodPosts.status, "available"),
-            gt(foodPosts.availableUntil, new Date())
+    const transactionResult = await db.transaction(
+      async (tx) => {
+        const [updatedFood] = await tx
+          .update(foodPosts)
+          .set({
+            status: "claimed",
+          })
+          .where(
+            and(
+              eq(foodPosts.id, foodId),
+              eq(foodPosts.status, "available"),
+              gt(foodPosts.availableUntil, new Date())
+            )
           )
-        )
-        .returning({
-          id: foodPosts.id,
-        });
+          .returning({
+            id: foodPosts.id,
+          });
 
-      /*
-       * If no row was updated, somebody else claimed it
-       * between our first check and this database operation.
-       */
-      if (!updatedFood) {
+        /*
+         * No row updated means another request
+         * already claimed the food or it expired.
+         */
+        if (!updatedFood) {
+          return {
+            success: false as const,
+            error: "This food is no longer available",
+          };
+        }
+
+        // Create claim after successfully claiming food
+        const [claim] = await tx
+          .insert(claims)
+          .values({
+            foodPostId: foodId,
+            userId: user.id,
+          })
+          .returning();
+
+        if (!claim) {
+          throw new Error("Failed to create claim");
+        }
+
         return {
-          success: false,
-          error: "This food is no longer available",
+          success: true as const,
+          claim,
         };
       }
+    );
 
-      // Create the claim only after successfully claiming the food
-      const [claim] = await tx
-        .insert(claims)
-        .values({
-          foodPostId: foodId,
-          userId: user.id,
-        })
-        .returning();
-
-      if (!claim) {
-        throw new Error("Failed to create claim");
-      }
-
-      return {
-        success: true,
-        claim,
-      };
-    });
-
-    // Another user claimed it first
-    if (!result.success) {
+    // Another request claimed the food first
+    if (!transactionResult.success) {
       return NextResponse.json(
-        { error: result.error },
+        {
+          error: transactionResult.error,
+        },
         { status: 409 }
       );
     }
@@ -151,7 +185,7 @@ export async function POST(request: Request) {
     return NextResponse.json(
       {
         message: "Food claimed successfully",
-        claim: result.claim,
+        claim: transactionResult.claim,
       },
       { status: 201 }
     );
@@ -159,7 +193,9 @@ export async function POST(request: Request) {
     console.error("Failed to claim food:", error);
 
     return NextResponse.json(
-      { error: "Failed to claim food" },
+      {
+        error: "Failed to claim food",
+      },
       { status: 500 }
     );
   }
