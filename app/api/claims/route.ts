@@ -1,21 +1,19 @@
 import { NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import { z } from "zod";
 
 import { db } from "@/lib/db";
 import { claims, foodPosts, users } from "@/lib/schema";
 
 const claimSchema = z.object({
-  foodId: z.coerce
-    .number()
-    .int()
-    .positive(),
+  foodId: z.coerce.number().int().positive(),
 });
 
 export async function POST(request: Request) {
   try {
-    // 1. Authentication
+    // Authentication
     const { userId: clerkId } = await auth();
 
     if (!clerkId) {
@@ -25,7 +23,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // 2. Read and validate request body
+    // Read request body
     let body: unknown;
 
     try {
@@ -37,20 +35,19 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = claimSchema.safeParse(body);
+    // Validate request
+    const parsed = claimSchema.safeParse(body);
 
-    if (!result.success) {
+    if (!parsed.success) {
       return NextResponse.json(
-        {
-          error: "Invalid food post ID",
-        },
+        { error: "Invalid food post ID" },
         { status: 400 }
       );
     }
 
-    const { foodId } = result.data;
+    const { foodId } = parsed.data;
 
-    // 3. Find logged-in database user
+    // Find logged-in database user
     const [user] = await db
       .select()
       .from(users)
@@ -64,7 +61,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // 4. Find food post
+    // Find food post
     const [food] = await db
       .select()
       .from(foodPosts)
@@ -78,7 +75,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // 5. Prevent owner from claiming own food
+    // Owner cannot claim own food
     if (food.userId === user.id) {
       return NextResponse.json(
         {
@@ -88,7 +85,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // 6. Check current status
+    // Check availability
     if (food.status !== "available") {
       return NextResponse.json(
         {
@@ -98,10 +95,8 @@ export async function POST(request: Request) {
       );
     }
 
-    // 7. Check expiration
-    const now = new Date();
-
-    if (new Date(food.availableUntil) <= now) {
+    // Check expiry
+    if (new Date(food.availableUntil) <= new Date()) {
       return NextResponse.json(
         {
           error: "This food is no longer available",
@@ -111,72 +106,40 @@ export async function POST(request: Request) {
     }
 
     /*
-     * 8. Atomic claim operation
+     * Neon HTTP does not support db.transaction()
      *
-     * The food is changed from:
+     * Therefore we use ONE PostgreSQL statement.
      *
-     * available → claimed
+     * The food is changed from available → claimed
+     * and the claim is inserted in the same database
+     * statement.
      *
-     * only if it is STILL available and
-     * has not expired.
-     *
-     * This prevents two users from
-     * successfully claiming the same food.
+     * This keeps the operation atomic.
      */
-    const transactionResult = await db.transaction(
-      async (tx) => {
-        const [updatedFood] = await tx
-          .update(foodPosts)
-          .set({
-            status: "claimed",
-          })
-          .where(
-            and(
-              eq(foodPosts.id, foodId),
-              eq(foodPosts.status, "available"),
-              gt(foodPosts.availableUntil, new Date())
-            )
-          )
-          .returning({
-            id: foodPosts.id,
-          });
+    const result = await db.execute(sql`
+      WITH claimed_food AS (
+        UPDATE ${foodPosts}
+        SET ${foodPosts.status} = 'claimed'
+        WHERE
+          ${foodPosts.id} = ${foodId}
+          AND ${foodPosts.status} = 'available'
+          AND ${foodPosts.availableUntil} > NOW()
+        RETURNING ${foodPosts.id}
+      )
+      INSERT INTO ${claims}
+        (${claims.foodPostId}, ${claims.userId})
+      SELECT
+        ${foodId},
+        ${user.id}
+      FROM claimed_food
+      RETURNING *
+    `);
 
-        /*
-         * No row updated means another request
-         * already claimed the food or it expired.
-         */
-        if (!updatedFood) {
-          return {
-            success: false as const,
-            error: "This food is no longer available",
-          };
-        }
-
-        // Create claim after successfully claiming food
-        const [claim] = await tx
-          .insert(claims)
-          .values({
-            foodPostId: foodId,
-            userId: user.id,
-          })
-          .returning();
-
-        if (!claim) {
-          throw new Error("Failed to create claim");
-        }
-
-        return {
-          success: true as const,
-          claim,
-        };
-      }
-    );
-
-    // Another request claimed the food first
-    if (!transactionResult.success) {
+    // No row inserted means another request claimed it first
+    if (result.rows.length === 0) {
       return NextResponse.json(
         {
-          error: transactionResult.error,
+          error: "This food is no longer available",
         },
         { status: 409 }
       );
@@ -185,7 +148,7 @@ export async function POST(request: Request) {
     return NextResponse.json(
       {
         message: "Food claimed successfully",
-        claim: transactionResult.claim,
+        claim: result.rows[0],
       },
       { status: 201 }
     );
