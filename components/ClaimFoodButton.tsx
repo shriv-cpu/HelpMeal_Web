@@ -63,7 +63,7 @@ export default function ClaimFoodButton({
         disabled={loading}
         className="w-full rounded-xl bg-[#198754] px-6 py-4 text-sm font-semibold text-white transition hover:bg-[#157347] disabled:cursor-not-allowed disabled:opacity-60"
       >
-        {loading ? "Claiming Food..." : "Claim This Food"}
+        {loading ? "Sending Request..." : "Request This Food"}
       </button>
 
       {error && (

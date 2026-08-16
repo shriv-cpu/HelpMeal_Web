@@ -1,3 +1,4 @@
+import NotificationButton from "@/components/NotificationButton";
 import Link from "next/link";
 import { UserButton } from "@clerk/nextjs";
 import {
@@ -204,7 +205,7 @@ export default async function HomePage({
             >
               Profile
             </Link>
-
+              <NotificationButton />
             <UserButton />
           </div>
         </div>

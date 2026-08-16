@@ -4,6 +4,7 @@ import {
   text,
   timestamp,
   integer,
+  boolean,
 } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
@@ -16,6 +17,7 @@ export const users = pgTable("users", {
 
 export const foodPosts = pgTable("food_posts", {
   id: serial("id").primaryKey(),
+
   userId: integer("user_id")
     .notNull()
     .references(() => users.id),
@@ -28,6 +30,7 @@ export const foodPosts = pgTable("food_posts", {
   location: text("location").notNull(),
   availableUntil: timestamp("available_until").notNull(),
 
+  // available | claimed
   status: text("status").default("available").notNull(),
 
   createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -43,6 +46,34 @@ export const claims = pgTable("claims", {
   userId: integer("user_id")
     .notNull()
     .references(() => users.id),
+
+  // pending | approved | denied
+  status: text("status").default("pending").notNull(),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+
+  respondedAt: timestamp("responded_at"),
+});
+
+export const notifications = pgTable("notifications", {
+  id: serial("id").primaryKey(),
+
+  // Person receiving the notification
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id),
+
+  // Related claim
+  claimId: integer("claim_id")
+    .references(() => claims.id),
+
+  type: text("type").notNull(),
+
+  title: text("title").notNull(),
+
+  message: text("message").notNull(),
+
+  read: boolean("read").default(false).notNull(),
 
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });

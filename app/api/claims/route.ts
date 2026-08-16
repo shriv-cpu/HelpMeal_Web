@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
-import { eq } from "drizzle-orm";
-import { sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 
 import { db } from "@/lib/db";
-import { claims, foodPosts, users } from "@/lib/schema";
+import {
+  claims,
+  foodPosts,
+  notifications,
+  users,
+} from "@/lib/schema";
 
 const claimSchema = z.object({
   foodId: z.coerce.number().int().positive(),
@@ -13,7 +17,7 @@ const claimSchema = z.object({
 
 export async function POST(request: Request) {
   try {
-    // 1. Check authentication
+    // 1. Authentication
     const { userId: clerkId } = await auth();
 
     if (!clerkId) {
@@ -35,7 +39,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // 3. Validate request
+    // 3. Validate food ID
     const parsed = claimSchema.safeParse(body);
 
     if (!parsed.success) {
@@ -47,7 +51,7 @@ export async function POST(request: Request) {
 
     const { foodId } = parsed.data;
 
-    // 4. Find logged-in database user
+    // 4. Find logged-in user
     const [user] = await db
       .select()
       .from(users)
@@ -61,7 +65,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // 5. Find food post
+    // 5. Find food
     const [food] = await db
       .select()
       .from(foodPosts)
@@ -75,17 +79,17 @@ export async function POST(request: Request) {
       );
     }
 
-    // 6. Prevent owner from claiming their own food
+    // 6. Owner cannot request their own food
     if (food.userId === user.id) {
       return NextResponse.json(
         {
-          error: "You cannot claim your own food post",
+          error: "You cannot request your own food",
         },
         { status: 400 }
       );
     }
 
-    // 7. Check food status
+    // 7. Food must still be available
     if (food.status !== "available") {
       return NextResponse.json(
         {
@@ -95,7 +99,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // 8. Check expiration
+    // 8. Check expiry
     if (new Date(food.availableUntil) <= new Date()) {
       return NextResponse.json(
         {
@@ -105,66 +109,107 @@ export async function POST(request: Request) {
       );
     }
 
-    /*
-     * 9. Atomically claim the food.
-     *
-     * We cannot use db.transaction() because the
-     * production Neon HTTP driver does not support it.
-     *
-     * This single SQL statement:
-     *
-     * available → claimed
-     * and
-     * creates the claim
-     *
-     * only when the food is still available.
-     */
-    const result = await db.execute(sql`
-      WITH claimed_food AS (
-        UPDATE ${foodPosts}
-        SET status = 'claimed'
-        WHERE
-          id = ${foodId}
-          AND status = 'available'
-          AND available_until > NOW()
-        RETURNING id
+    // 9. Prevent duplicate pending/approved request
+    const [existingClaim] = await db
+      .select()
+      .from(claims)
+      .where(
+        and(
+          eq(claims.foodPostId, foodId),
+          eq(claims.userId, user.id)
+        )
       )
-      INSERT INTO ${claims}
-        (food_post_id, user_id)
-      SELECT
-        ${foodId},
-        ${user.id}
-      FROM claimed_food
-      RETURNING *
-    `);
+      .limit(1);
 
-    /*
-     * If nothing was inserted, another request
-     * already claimed the food or it expired.
-     */
-    if (result.rows.length === 0) {
-      return NextResponse.json(
-        {
-          error: "This food is no longer available",
-        },
-        { status: 409 }
-      );
+    if (existingClaim) {
+      if (existingClaim.status === "pending") {
+        return NextResponse.json(
+          {
+            error: "You already have a pending request for this food",
+          },
+          { status: 409 }
+        );
+      }
+
+      if (existingClaim.status === "approved") {
+        return NextResponse.json(
+          {
+            error: "You have already been approved for this food",
+          },
+          { status: 409 }
+        );
+      }
+
+      // If previous request was denied, allow a new request
+      if (existingClaim.status === "denied") {
+        const [newClaim] = await db
+          .insert(claims)
+          .values({
+            foodPostId: foodId,
+            userId: user.id,
+            status: "pending",
+          })
+          .returning();
+
+        if (!newClaim) {
+          throw new Error("Failed to create claim request");
+        }
+
+        await db.insert(notifications).values({
+          userId: food.userId,
+          claimId: newClaim.id,
+          type: "claim_request",
+          title: "New Food Request",
+          message: `${user.name} wants to claim your food: ${food.title}`,
+        });
+
+        return NextResponse.json(
+          {
+            message: "Food request sent successfully",
+            claim: newClaim,
+          },
+          { status: 201 }
+        );
+      }
     }
 
-    // 10. Success
+    // 10. Create pending claim
+    const [claim] = await db
+      .insert(claims)
+      .values({
+        foodPostId: foodId,
+        userId: user.id,
+        status: "pending",
+      })
+      .returning();
+
+    if (!claim) {
+      throw new Error("Failed to create claim request");
+    }
+
+    // 11. Notify food owner
+    await db.insert(notifications).values({
+      userId: food.userId,
+      claimId: claim.id,
+      type: "claim_request",
+      title: "New Food Request",
+      message: `${user.name} wants to claim your food: ${food.title}`,
+    });
+
+    // 12. Return pending request
     return NextResponse.json(
       {
-        message: "Food claimed successfully",
-        claim: result.rows[0],
+        message: "Food request sent successfully",
+        claim,
       },
       { status: 201 }
     );
   } catch (error) {
-    console.error("Failed to claim food:", error);
+    console.error("Failed to create food request:", error);
 
     return NextResponse.json(
       {
-        error: "Failed to claim food",
+        error: "Failed to create food request",
       },
       { status: 500 }
     );
