@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 
@@ -13,7 +13,7 @@ const claimSchema = z.object({
 
 export async function POST(request: Request) {
   try {
-    // Authentication
+    // 1. Check authentication
     const { userId: clerkId } = await auth();
 
     if (!clerkId) {
@@ -23,7 +23,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Read request body
+    // 2. Read request body
     let body: unknown;
 
     try {
@@ -35,7 +35,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Validate request
+    // 3. Validate request
     const parsed = claimSchema.safeParse(body);
 
     if (!parsed.success) {
@@ -47,7 +47,7 @@ export async function POST(request: Request) {
 
     const { foodId } = parsed.data;
 
-    // Find logged-in database user
+    // 4. Find logged-in database user
     const [user] = await db
       .select()
       .from(users)
@@ -61,7 +61,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Find food post
+    // 5. Find food post
     const [food] = await db
       .select()
       .from(foodPosts)
@@ -75,7 +75,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Owner cannot claim own food
+    // 6. Prevent owner from claiming their own food
     if (food.userId === user.id) {
       return NextResponse.json(
         {
@@ -85,7 +85,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check availability
+    // 7. Check food status
     if (food.status !== "available") {
       return NextResponse.json(
         {
@@ -95,7 +95,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check expiry
+    // 8. Check expiration
     if (new Date(food.availableUntil) <= new Date()) {
       return NextResponse.json(
         {
@@ -106,28 +106,31 @@ export async function POST(request: Request) {
     }
 
     /*
-     * Neon HTTP does not support db.transaction()
+     * 9. Atomically claim the food.
      *
-     * Therefore we use ONE PostgreSQL statement.
+     * We cannot use db.transaction() because the
+     * production Neon HTTP driver does not support it.
      *
-     * The food is changed from available → claimed
-     * and the claim is inserted in the same database
-     * statement.
+     * This single SQL statement:
      *
-     * This keeps the operation atomic.
+     * available → claimed
+     * and
+     * creates the claim
+     *
+     * only when the food is still available.
      */
     const result = await db.execute(sql`
       WITH claimed_food AS (
         UPDATE ${foodPosts}
-        SET ${foodPosts.status} = 'claimed'
+        SET status = 'claimed'
         WHERE
-          ${foodPosts.id} = ${foodId}
-          AND ${foodPosts.status} = 'available'
-          AND ${foodPosts.availableUntil} > NOW()
-        RETURNING ${foodPosts.id}
+          id = ${foodId}
+          AND status = 'available'
+          AND available_until > NOW()
+        RETURNING id
       )
       INSERT INTO ${claims}
-        (${claims.foodPostId}, ${claims.userId})
+        (food_post_id, user_id)
       SELECT
         ${foodId},
         ${user.id}
@@ -135,7 +138,10 @@ export async function POST(request: Request) {
       RETURNING *
     `);
 
-    // No row inserted means another request claimed it first
+    /*
+     * If nothing was inserted, another request
+     * already claimed the food or it expired.
+     */
     if (result.rows.length === 0) {
       return NextResponse.json(
         {
@@ -145,6 +151,7 @@ export async function POST(request: Request) {
       );
     }
 
+    // 10. Success
     return NextResponse.json(
       {
         message: "Food claimed successfully",
